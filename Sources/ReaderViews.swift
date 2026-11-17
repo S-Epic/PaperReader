@@ -27,6 +27,9 @@ struct ReaderWindow: View {
             }
         }
         .onDrop(of: [.fileURL], isTargeted: $sync.isDropTarget, perform: acceptDrop)
+        .sheet(isPresented: $sync.isHistoryPresented) {
+            historySheet
+        }
     }
 
     private var toolbar: some View {
@@ -37,11 +40,20 @@ struct ReaderWindow: View {
             .keyboardShortcut("o", modifiers: .command)
             .accessibilityIdentifier("OpenPDF")
 
-            Text(model.sourceURL?.lastPathComponent ?? "")
+            Button {
+                sync.historyOpenError = nil
+                sync.isHistoryPresented = true
+            } label: {
+                Label("翻译历史", systemImage: "clock.arrow.circlepath")
+            }
+            .keyboardShortcut("h", modifiers: [.command, .shift])
+            .accessibilityIdentifier("OpenTranslationHistory")
+
+            Text(model.documentName ?? "")
                 .font(.subheadline.weight(.medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .help(model.sourceURL?.lastPathComponent ?? "")
+                .help(model.documentName ?? "")
                 .accessibilityIdentifier("DocumentName")
             Spacer()
 
@@ -106,6 +118,95 @@ struct ReaderWindow: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var historySheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("翻译历史")
+                    .font(.title2.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                Button("关闭") { sync.isHistoryPresented = false }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("CloseTranslationHistory")
+            }
+            .padding(16)
+
+            Divider()
+
+            if model.history.isEmpty {
+                VStack(spacing: 8) {
+                    Text("暂无翻译记录")
+                        .font(.headline)
+                    Text("完成翻译的文献会自动出现在这里。")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier("TranslationHistoryEmpty")
+            } else {
+                List(model.history) { entry in
+                    Button { openHistory(entry) } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "doc.text")
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(entry.documentName)
+                                    .font(.body.weight(.medium))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Text("\(entry.completedAt.formatted(date: .abbreviated, time: .shortened)) · \(entry.pageCount) 页")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if model.activeHistoryID == entry.id {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(Color.accentColor)
+                                    .accessibilityLabel("当前打开")
+                            }
+                        }
+                        .padding(.vertical, 6)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.isTranslating)
+                    .help(entry.documentName)
+                    .accessibilityHint("打开原文和译文")
+                    .accessibilityIdentifier("TranslationHistoryEntry")
+                }
+                .accessibilityIdentifier("TranslationHistoryList")
+            }
+
+            if let error = sync.historyOpenError {
+                historyNotice(error)
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("TranslationHistoryError")
+            } else if model.isTranslating && !model.history.isEmpty {
+                historyNotice("本次翻译完成或取消后，可以打开历史记录。")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 520, height: 400)
+        .accessibilityIdentifier("TranslationHistory")
+    }
+
+    private func historyNotice(_ message: String) -> some View {
+        Text(message)
+            .font(.callout)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+    }
+
+    private func openHistory(_ entry: TranslationHistoryEntry) {
+        model.openHistory(entry)
+        if model.activeHistoryID == entry.id, model.errorMessage == nil {
+            sync.isHistoryPresented = false
+        } else {
+            sync.historyOpenError = model.errorMessage
+        }
     }
 
     private var reader: some View {
@@ -220,6 +321,8 @@ struct ReaderAnchor {
 @MainActor
 final class ReaderSync: ObservableObject {
     @Published var isDropTarget = false
+    @Published var isHistoryPresented = false
+    @Published var historyOpenError: String?
     @Published private(set) var currentPage = 1
     @Published private(set) var pageCount = 0
     @Published private(set) var scale: CGFloat = 1

@@ -45,23 +45,37 @@ private struct EngineEvent: Decodable {
 
 @MainActor
 final class TranslationModel: ObservableObject {
+    private struct ActiveJob {
+        let id: UUID
+        let documentName: String
+        let pageCount: Int
+        var task: Process?
+    }
+
     @Published private(set) var sourceURL: URL?
     @Published private(set) var translatedURL: URL?
     @Published private(set) var bilingualURL: URL?
+    @Published private(set) var documentName: String?
+    @Published private(set) var history: [TranslationHistoryEntry]
+    @Published private(set) var activeHistoryID: UUID?
     @Published private(set) var isTranslating = false
     @Published private(set) var progress = 0.0
     @Published private(set) var status = "拖入英文论文以开始"
     @Published var errorMessage: String?
 
     private let engine: TranslationEngine
-    private let jobsRoot: URL?
-    private var runningJob: (id: UUID, task: Process)?
+    private let historyStore: TranslationHistoryStore
+    private var runningJob: ActiveJob?
     private var sourceAccess: URL?
     private var chooserOpen = false
 
     init(engine: TranslationEngine = .bundled, jobsRoot: URL? = nil) {
         self.engine = engine
-        self.jobsRoot = jobsRoot
+        let root = jobsRoot ?? URL.homeDirectory
+            .appendingPathComponent("Library/Application Support/PaperReader/Translations", isDirectory: true)
+        let store = TranslationHistoryStore(root: root)
+        self.historyStore = store
+        self.history = store.entries()
     }
 
     var canExport: Bool { bilingualURL != nil }
@@ -95,52 +109,89 @@ final class TranslationModel: ObservableObject {
         sourceAccess?.stopAccessingSecurityScopedResource()
         sourceAccess = scoped ? url : nil
         sourceURL = url
+        documentName = url.lastPathComponent
         translatedURL = nil
         bilingualURL = nil
+        activeHistoryID = nil
         errorMessage = nil
         status = "准备翻译"
         progress = 0
         isTranslating = true
 
         let id = UUID()
-        do {
-            let output = try FileManager.default.url(
-                for: .applicationSupportDirectory, in: .userDomainMask,
-                appropriateFor: nil, create: true
-            ).appendingPathComponent("PaperReader/Translations", isDirectory: true)
-            let job = (jobsRoot ?? output).appendingPathComponent(id.uuidString, isDirectory: true)
-            try FileManager.default.createDirectory(
-                at: job, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
-            )
-            try startEngine(id: id, input: url, output: job)
-        } catch {
-            isTranslating = false
-            status = "翻译无法启动"
-            errorMessage = "无法启动本机翻译引擎，请重新打开 App 后再试。"
+        runningJob = ActiveJob(id: id, documentName: url.lastPathComponent, pageCount: document.pageCount)
+        let store = historyStore
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let input = try store.prepare(id: id, source: url)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.runningJob?.id == id else {
+                        store.discardIncomplete(id: id)
+                        return
+                    }
+                    do {
+                        try self.startEngine(id: id, input: input, output: store.directory(for: id))
+                    } catch {
+                        self.failJob(id: id, message: "无法启动本机翻译引擎，请重新打开 App 后再试。")
+                    }
+                }
+            } catch {
+                store.discardIncomplete(id: id)
+                DispatchQueue.main.async { [weak self] in
+                    self?.failJob(id: id, message: "无法保存原文副本，请检查磁盘空间和文件访问权限。")
+                }
+            }
         }
     }
 
     func cancelTranslation() {
         guard let job = runningJob else { return }
         runningJob = nil
-        if job.task.isRunning { job.task.terminate() }
+        if let task = job.task, task.isRunning { task.terminate() }
         isTranslating = false
         status = "翻译已取消"
     }
 
+    func openHistory(_ entry: TranslationHistoryEntry) {
+        guard runningJob == nil, history.contains(where: { $0.id == entry.id }) else { return }
+        do {
+            let documents = try historyStore.documents(for: entry)
+            guard [documents.source, documents.translated, documents.bilingual].allSatisfy({ url in
+                guard let pdf = PDFDocument(url: url), !pdf.isLocked else { return false }
+                return pdf.pageCount == entry.pageCount
+            }) else { throw CocoaError(.fileReadCorruptFile) }
+
+            sourceAccess?.stopAccessingSecurityScopedResource()
+            sourceAccess = nil
+            documentName = entry.documentName
+            sourceURL = documents.source
+            translatedURL = documents.translated
+            bilingualURL = documents.bilingual
+            activeHistoryID = entry.id
+            progress = 1
+            status = "已从历史记录打开"
+            errorMessage = nil
+        } catch {
+            errorMessage = "无法打开此记录，保存的 PDF 可能已被移动或损坏。"
+            history = historyStore.entries()
+        }
+    }
+
     func exportBilingual() {
-        guard let sourceURL, canExport, !chooserOpen else { return }
+        guard let documentName, let exportSource = bilingualURL, !chooserOpen else { return }
         chooserOpen = true
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.pdf]
-        panel.nameFieldStringValue = sourceURL.deletingPathExtension().lastPathComponent + ".zh-CN.dual.pdf"
+        panel.nameFieldStringValue = (documentName as NSString).deletingPathExtension + ".zh-CN.dual.pdf"
         panel.prompt = "导出"
         panel.begin { [weak self] result in
             guard let self else { return }
             self.chooserOpen = false
             guard result == .OK, let url = panel.url else { return }
             do {
-                try self.exportBilingual(to: url)
+                try self.copyBilingual(from: exportSource, to: url)
                 self.status = "已导出双语 PDF"
             } catch {
                 self.errorMessage = "无法写入所选位置，请换一个导出位置后再试。"
@@ -150,6 +201,10 @@ final class TranslationModel: ObservableObject {
 
     func exportBilingual(to destination: URL) throws {
         guard let bilingualURL else { throw CocoaError(.fileNoSuchFile) }
+        try copyBilingual(from: bilingualURL, to: destination)
+    }
+
+    private func copyBilingual(from bilingualURL: URL, to destination: URL) throws {
         if bilingualURL.standardizedFileURL == destination.standardizedFileURL { return }
         let destinationAccess = destination.startAccessingSecurityScopedResource()
         defer { if destinationAccess { destination.stopAccessingSecurityScopedResource() } }
@@ -171,52 +226,73 @@ final class TranslationModel: ObservableObject {
         task.standardOutput = events
         task.standardError = FileHandle.nullDevice
         try task.run()
-        runningJob = (id, task)
+        runningJob?.task = task
 
+        let store = historyStore
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let reader = events.fileHandleForReading
             defer { try? reader.close() }
             var pending = Data()
+            var terminalEvent: EngineEvent?
             while let part = try? reader.read(upToCount: 16_384), !part.isEmpty {
                 pending.append(part)
                 while let newline = pending.firstIndex(of: 10) {
                     let line = Data(pending[..<newline])
                     pending.removeSubrange(...newline)
                     if let event = try? JSONDecoder().decode(EngineEvent.self, from: line) {
-                        DispatchQueue.main.async { [weak self] in
-                            self?.receive(event, jobID: id, output: output)
+                        if event.type == "result" || event.type == "error" {
+                            terminalEvent = event
+                        } else if event.type == "progress" {
+                            DispatchQueue.main.async { [weak self] in
+                                self?.updateProgress(event, jobID: id)
+                            }
                         }
                     }
                 }
             }
             task.waitUntilExit()
-            DispatchQueue.main.async { [weak self] in self?.engineExited(jobID: id) }
+            let result = terminalEvent
+            let exitStatus = task.terminationStatus
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.runningJob?.id == id else {
+                    store.discardIncomplete(id: id)
+                    return
+                }
+                self.finishEngine(jobID: id, output: output, result: result, exitStatus: exitStatus)
+            }
         }
     }
 
-    private func receive(_ event: EngineEvent, jobID: UUID, output: URL) {
+    private func updateProgress(_ event: EngineEvent, jobID: UUID) {
         guard runningJob?.id == jobID else { return }
-        switch event.type {
-        case "progress":
-            progress = max(progress, min(1, event.progress ?? 0))
-            if let stage = event.stage, !stage.isEmpty { status = stage }
-        case "result":
-            guard let mono = outputFile(event.mono_path, in: output),
-                  let dual = outputFile(event.dual_path, in: output) else {
-                errorMessage = "翻译结束，但没有生成可用的中文和双语 PDF。"
-                return
-            }
-            translatedURL = mono
-            bilingualURL = dual
-            progress = 1
-            status = "翻译完成"
-            isTranslating = false
-        case "error":
-            errorMessage = event.message ?? "翻译失败。"
-            status = "翻译失败"
-            isTranslating = false
-        default:
-            break
+        progress = max(progress, min(1, event.progress ?? 0))
+        if let stage = event.stage, !stage.isEmpty { status = stage }
+    }
+
+    private func finishEngine(jobID: UUID, output: URL, result: EngineEvent?, exitStatus: Int32) {
+        guard let job = runningJob, job.id == jobID else { return }
+        guard exitStatus == 0, result?.type == "result",
+              let mono = outputFile(result?.mono_path, in: output),
+              let dual = outputFile(result?.dual_path, in: output) else {
+            failJob(id: jobID, message: result?.message ?? "翻译未完成，请检查网络后重新打开 PDF。")
+            return
+        }
+
+        runningJob = nil
+        translatedURL = mono
+        bilingualURL = dual
+        progress = 1
+        status = "翻译完成"
+        isTranslating = false
+        do {
+            try historyStore.record(
+                id: jobID, documentName: job.documentName, pageCount: job.pageCount,
+                translated: mono, bilingual: dual
+            )
+            history = historyStore.entries()
+            activeHistoryID = jobID
+        } catch {
+            errorMessage = "译文已就绪并可导出，但本次未能保存到翻译历史。"
         }
     }
 
@@ -227,13 +303,12 @@ final class TranslationModel: ObservableObject {
         return file.path.hasPrefix(folder + "/") && FileManager.default.isReadableFile(atPath: file.path) ? file : nil
     }
 
-    private func engineExited(jobID: UUID) {
-        guard runningJob?.id == jobID else { return }
+    private func failJob(id: UUID, message: String) {
+        guard runningJob?.id == id else { return }
         runningJob = nil
         isTranslating = false
-        if translatedURL == nil {
-            status = "翻译失败"
-            if errorMessage == nil { errorMessage = "翻译任务提前退出，请检查网络后重新打开 PDF。" }
-        }
+        historyStore.discardIncomplete(id: id)
+        status = "翻译失败"
+        errorMessage = message
     }
 }
